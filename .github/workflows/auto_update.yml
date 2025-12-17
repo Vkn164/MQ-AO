@@ -2,7 +2,7 @@ name: Auto Update Submodules
 
 on:
   schedule:
-    - cron: '0 * * * *' # hourly
+    - cron: '0 0 * * *' # every 24h
   workflow_dispatch:
 
 jobs:
