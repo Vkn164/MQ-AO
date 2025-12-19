@@ -2,8 +2,11 @@ name: Auto Update Submodules
 
 on:
   schedule:
-    - cron: '0 0 * * *' # every 24h
+    - cron: '0 0 * * *' # every day at 00:00 UTC
   workflow_dispatch:
+
+permissions:
+  contents: write  # allow pushing commits
 
 jobs:
   update-submodules:
@@ -14,32 +17,98 @@ jobs:
         uses: actions/checkout@v3
         with:
           submodules: recursive
-          fetch-depth: 0   # needed to fetch full history
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Update submodules if needed
+      - name: Set git identity
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          changed=false
+      - name: Update submodules to latest tracked branch (record name + SHAs)
+        run: |
+          set -euxo pipefail
 
-          # Loop through submodules
-          git submodule foreach '
-            echo "Checking $name..."
-            git fetch origin
-            latest_commit=$(git rev-parse origin/HEAD)
-            current_commit=$(git rev-parse HEAD)
-            if [ "$latest_commit" != "$current_commit" ]; then
-              echo "$name has a new commit. Updating..."
-              git checkout $latest_commit
-              changed=true
+          git submodule sync --recursive
+          rm -f .submodules_changed .submodules_updates || true
+
+          git submodule foreach --recursive '
+            echo "=== Processing submodule: $name ($path) ==="
+
+            # Determine branch to track (from .gitmodules if declared)
+            branch=$(git config -f "$toplevel/.gitmodules" submodule."$name".branch || true)
+
+            if [ -z "$branch" ]; then
+              if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+                branch=main
+              elif git ls-remote --exit-code --heads origin master >/dev/null 2>&1; then
+                branch=master
+              else
+                branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+              fi
+            fi
+
+            echo "Tracking branch: ${branch:-<none>}"
+
+            # Record current commit
+            before_sha=$(git rev-parse --verify HEAD)
+
+            if [ -n "$branch" ]; then
+              # Fetch and move to origin/<branch>
+              git fetch origin "$branch" --quiet || true
+
+              if git show-ref --verify --quiet "refs/heads/$branch"; then
+                git checkout "$branch"
+              else
+                git checkout -b "$branch" "origin/$branch" 2>/dev/null || git checkout --detach "origin/$branch"
+              fi
+
+              git reset --hard "origin/$branch"
+
+              # new commit
+              after_sha=$(git rev-parse --verify HEAD)
+
+              if [ "$before_sha" != "$after_sha" ]; then
+                # Append a short summary line to the superproject marker file
+                # Format: path: branch (old..new)
+                printf "%s: %s (%s -> %s)\n" "$path" "$branch" "${before_sha:0:7}" "${after_sha:0:7}" >> "$toplevel/.submodules_updates"
+
+                # stage the submodule change in the superproject
+                git -C "$toplevel" add "$path"
+
+                # flag that something changed
+                touch "$toplevel/.submodules_changed"
+              else
+                echo "No update for $name ($path)"
+              fi
+            else
+              echo "No branch found for $name — skipping"
             fi
           '
 
-          if [ "$changed" = true ]; then
+      - name: Commit & push with submodule names + SHAs
+        run: |
+          set -euxo pipefail
+          if [ -f .submodules_changed ]; then
+            git add .gitmodules || true
+            # ensure staged submodule pointer updates are included
             git add .
-            git commit -m "Auto-update submodules to latest commits"
-            git push
+
+            # prepare commit message
+            {
+              echo "Auto-update submodule pointers to latest remote branches"
+              echo
+              echo "Updates:"
+              sed -e "s/^/ - /" .submodules_updates
+            } > /tmp/commit_msg
+
+            # commit only if there's something to commit
+            if git diff --cached --quiet; then
+              echo "Nothing to commit."
+            else
+              git commit -F /tmp/commit_msg
+              git push
+            fi
           else
-            echo "No submodule updates needed."
+            echo "No submodule updates required."
           fi
